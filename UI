@@ -482,13 +482,24 @@ function Kirin:CreateWindow(cfg)
 	local ghostB = wd("Text", { Text = title, Size = 15, Font = F_BOLD, Outline = true })
 	local titleText = wd("Text", { Text = title, Size = 15, Font = F_BOLD, Outline = true })
 	local subText = wd("Text", { Text = author, Size = 10, Font = F_MONO, Outline = true })
+	-- Always-visible vector window controls; existing actions/hit areas are unchanged.
+	local WINDOW_GLYPHS = {
+		close = {{-4,-4,4,4},{4,-4,-4,4}},
+		minimize = {{-4,2,4,2}},
+		expand = {{-4,-4,4,-4},{4,-4,4,4},{4,4,-4,4},{-4,4,-4,-4}},
+		restore = {{-4,-2,2,-2},{2,-2,2,4},{2,4,-4,4},{-4,4,-4,-2},
+			{-1,-4,4,-4},{4,-4,4,1},{4,1,3,1}},
+	}
 	local tBtns = {}
-	local GLYPH = { "x", "-", "+" }
 	for i = 1, 3 do
-		tBtns[i] = {
-			c = wd("Circle", { Filled = true, NumSides = 20, Radius = 6 }),
-			g = wd("Text", { Text = GLYPH[i], Size = 12, Font = F_MONO, Center = true }),
+		local b = {
+			bg = wd("Square", { Filled = true, Rounding = 5 }),
+			border = wd("Square", { Filled = false, Thickness = 1, Rounding = 5 }),
+			strokes = {},
 		}
+		local count = i == 1 and 2 or (i == 2 and 1 or 7)
+		for j = 1, count do b.strokes[j] = wd("Line", { Thickness = 1.5 }) end
+		tBtns[i] = b
 	end
 
 	local headTitle = wd("Text", { Size = 17, Font = F_BOLD, Outline = true })
@@ -1355,14 +1366,25 @@ function Kirin:CreateWindow(cfg)
 		subText.Text = author .. ((math.floor(now * 1.4) % 2 == 0) and " _" or "")
 		subText.Position = V(X + 44, Y + 25); subText.Color = T.TextDim; subText.Visible = true
 
-		local bcol = { T.Error, T.Warn, T.Accent }
 		for i = 1, 3 do
 			local b = tBtns[i]
 			local hot = (mx - bx[i]) ^ 2 + (my - by) ^ 2 <= 81
-			b.c.Position = V(bx[i], by); b.c.Radius = hot and 7 or 6
-			b.c.Color = overBtns and bcol[i] or mixC(bcol[i], T.BgAlt, 0.3)
-			b.c.Visible = true
-			b.g.Position = V(bx[i], by - 8); b.g.Color = Color3.fromRGB(20, 16, 28); b.g.Visible = btnHover > 0.5
+			local tone = i == 1 and T.Error or T.Accent
+			b.bg.Position = V(bx[i] - 9, by - 9); b.bg.Size = V(18, 18)
+			b.bg.Color = mixC(T.BgAlt, tone, hot and 0.22 or 0.07); b.bg.Visible = true
+			b.border.Position = b.bg.Position; b.border.Size = b.bg.Size
+			b.border.Color = hot and tone or T.BorderLit; b.border.Visible = true
+			local glyph = i == 1 and WINDOW_GLYPHS.close or (i == 2 and WINDOW_GLYPHS.minimize
+				or (expanded and WINDOW_GLYPHS.restore or WINDOW_GLYPHS.expand))
+			for j, stroke in ipairs(b.strokes) do
+				local segment = glyph[j]
+				stroke.Visible = segment ~= nil
+				if segment then
+					stroke.From = V(bx[i] + segment[1], by + segment[2])
+					stroke.To = V(bx[i] + segment[3], by + segment[4])
+					stroke.Color = i == 1 and T.Error or (hot and T.AccentGlow or T.TextSub)
+				end
+			end
 		end
 
 		local sy = Y + TITLE_H + 14
