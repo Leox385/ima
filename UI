@@ -1,36 +1,130 @@
--- Based on the user's rev 3.1. Background FX retained; decorative radar removed.
-local RunService = game:GetService("RunService")
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local lp = Players.LocalPlayer
-local mouse = lp and lp:GetMouse()
-local camera = workspace.CurrentCamera
-local clock = (typeof(os) == "table" and os.clock) or tick
+-- Runtime adapter for Drawing-based Matcha LuaVM interfaces.
+local typeOf = typeof or type
+local function safeGet(object, key)
+    if object == nil then return nil end
+    local ok, value = pcall(function() return object[key] end)
+    return ok and value or nil
+end
+local function service(name)
+    local ok, value = pcall(function() return game:GetService(name) end)
+    return ok and value or nil
+end
+assert(Drawing and type(Drawing.new) == "function", "Astra UI: this LuaVM needs Drawing.new")
+assert(Vector2 and Color3, "Astra UI: Vector2 and Color3 are required")
+local taskHost = task or {}
+local spawnHost = taskHost.spawn or spawn
+local waitHost = taskHost.wait or wait
+assert(type(spawnHost) == "function" and type(waitHost) == "function", "Astra UI: task.spawn/spawn and task.wait/wait are required")
+local clock = (os and os.clock) or tick
+assert(type(clock) == "function", "Astra UI: os.clock or tick is required")
 local unpackf = table.unpack or unpack
-
-if _G.__AstraCleanup then pcall(_G.__AstraCleanup) end
-
-local function probe(kind, prop, val)
-	local ok = pcall(function()
-		local d = Drawing.new(kind)
-		d[prop] = val
-		d:Remove()
-	end)
-	return ok
+local runtimeAlive = true
+local function background(fn)
+    spawnHost(function()
+        waitHost() -- Matcha spawn begins immediately; yield before optional work.
+        if runtimeAlive then fn() end
+    end)
+end
+local function report(message)
+    local out = warn or print
+    if type(out) == "function" then pcall(out, "[Astra] " .. tostring(message)) end
+end
+local RunService, Players, UserInputService = service("RunService"), service("Players"), service("UserInputService")
+local lp, mouse = safeGet(Players, "LocalPlayer"), nil
+local viewport = Vector2.new(1280, 720)
+local camera = setmetatable({}, { __index = function(_, key) if key == "ViewportSize" then return viewport end end })
+local function refreshRuntime()
+    lp = safeGet(Players, "LocalPlayer") or lp
+    if not mouse and lp then pcall(function() mouse = lp:GetMouse() end) end
+    local current = safeGet(workspace, "CurrentCamera")
+    local size = safeGet(current, "ViewportSize") or safeGet(Drawing, "Viewport")
+    if size and size.X and size.Y and size.X > 0 and size.Y > 0 then viewport = size end
+end
+refreshRuntime()
+local function connectOptional(signal, callback)
+    if not signal or type(safeGet(signal, "Connect")) ~= "function" then return nil end
+    local ok, connection = pcall(function() return signal:Connect(callback) end)
+    return ok and connection or nil
+end
+local function connectFrame(callback)
+    for _, name in ipairs({ "RenderStepped", "Heartbeat" }) do
+        local connection = connectOptional(safeGet(RunService, name), callback)
+        if connection then return connection end
+    end
+    local active = true
+    background(function()
+        local last = clock()
+        while active and runtimeAlive do
+            local now = clock()
+            callback(math.max(0.001, now - last))
+            last = now
+            waitHost()
+        end
+    end)
+    return { Disconnect = function() active = false end }
+end
+local function finite(value, fallback)
+    local n = tonumber(value)
+    if not n or n ~= n or n == math.huge or n == -math.huge then return fallback end
+    return n
+end
+local function normalizeKey(value)
+    if type(value) == "number" then return math.max(0, math.min(255, math.floor(finite(value, 0)))) end
+    local name = type(value) == "string" and value or safeGet(value, "Name")
+    if not name then return 0 end
+    name = string.lower(name)
+    local map = { none=0, space=32, tab=9, enter=13, ["return"]=13, backspace=8,
+        esc=27, escape=27, shift=16, leftshift=16, rightshift=16, ctrl=17, leftcontrol=17,
+        rightcontrol=17, alt=18, leftalt=18, rightalt=18, pageup=33, pagedown=34,
+        left=37, up=38, right=39, down=40, insert=45, delete=46,
+        zero=48, one=49, two=50, three=51, four=52, five=53, six=54, seven=55, eight=56, nine=57,
+        m1=1, mousebutton1=1, m2=2, mousebutton2=2, mousebutton3=4 }
+    if map[name] then return map[name] end
+    if #name == 1 then return string.byte(string.upper(name)) end
+    local f = tonumber(name:match("^f(%d+)$"))
+    if f and f >= 1 and f <= 12 then return 111 + f end
+    return 0
+end
+local function colorValid(value)
+    return value and finite(safeGet(value, "R")) ~= nil and finite(safeGet(value, "G")) ~= nil and finite(safeGet(value, "B")) ~= nil
+end
+local function utf8Prefix(text, length)
+    length = math.max(0, math.min(#text, length))
+    if length < #text then
+        local nextByte = string.byte(text, length + 1)
+        while length > 0 and nextByte and nextByte >= 128 and nextByte < 192 do
+            length = length - 1
+            nextByte = string.byte(text, length + 1)
+        end
+    end
+    return string.sub(text, 1, length)
 end
 
-local HAS_T = probe("Square", "Transparency", 0.5)
-local HAS_BOUNDS = pcall(function()
-	local d = Drawing.new("Text")
-	d.Text = "abcdef"
-	d.Size = 13
-	local b = d.TextBounds
-	d:Remove()
-	if typeof(b) ~= "Vector2" or b.X < 5 then error("nobounds") end
-end)
+if type(_G.__AstraCleanup) == "function" then pcall(_G.__AstraCleanup) end
 
-local FONTS = (typeof(Drawing.Fonts) == "table") and Drawing.Fonts or {}
-local F_UI = FONTS.UI or 0
+local function probe(kind, prop, val)
+	local d
+	local ok = pcall(function() d = Drawing.new(kind); d[prop] = val end)
+	if d then pcall(function() d:Remove() end) end
+	return ok
+end
+local HAS_T = probe("Square", "Transparency", 0.5)
+local HAS_CORNER = probe("Square", "Corner", 5)
+local HAS_FONTSIZE = probe("Text", "FontSize", 14)
+local HAS_BOUNDS = false
+do
+	local d
+	local ok, bounds = pcall(function()
+		d = Drawing.new("Text"); d.Text = "abcdef"
+		if HAS_FONTSIZE then d.FontSize = 13 else d.Size = 13 end
+		return d.TextBounds
+	end)
+	HAS_BOUNDS = ok and bounds ~= nil and finite(safeGet(bounds, "X"), 0) > 5
+	if d then pcall(function() d:Remove() end) end
+end
+
+local FONTS = (typeOf(Drawing.Fonts) == "table") and Drawing.Fonts or {}
+local F_UI = FONTS.System or FONTS.UI or 0
 local F_BOLD = FONTS.SystemBold or FONTS.Plex or 2
 local F_MONO = FONTS.Monospace or 3
 
@@ -40,12 +134,12 @@ local bobData, bobBusy, bobFailed = nil, false, false
 local function fetchImage(src)
 	if not src or src == "" then return nil end
 	local raw
-	if typeof(readfile) == "function" then
+	if typeOf(readfile) == "function" then
 		local ok, d = pcall(readfile, src)
 		if ok and type(d) == "string" and #d > 200 then raw = d end
 	end
 	if not raw and string.sub(src, 1, 4) == "http" then
-		if typeof(httpget) == "function" then pcall(function() raw = httpget(src) end) end
+		if typeOf(httpget) == "function" then pcall(function() raw = httpget(src) end) end
 		if not raw then pcall(function() raw = game:HttpGet(src) end) end
 	end
 	if type(raw) == "string" and #raw > 200 then return raw end
@@ -55,7 +149,7 @@ end
 local function loadBob()
 	if bobData or bobBusy or bobFailed then return bobData end
 	bobBusy = true
-	task.spawn(function()
+	background(function()
 	for _, f in ipairs({ "spongebob.dat", "spongebob_dl.dat" }) do
 		local d = fetchImage(f)
 		if d then
@@ -67,7 +161,7 @@ local function loadBob()
 		local d = fetchImage(BOB_URL)
 		if d and #d > 1000 then
 			bobData = d
-			if typeof(writefile) == "function" then pcall(writefile, "spongebob.dat", d) end
+			if typeOf(writefile) == "function" then pcall(writefile, "spongebob.dat", d) end
 		else
 			bobFailed = true
 		end
@@ -75,7 +169,7 @@ local function loadBob()
 	end)
 	return nil
 end
-loadBob()
+-- Launcher images are loaded only when the minimized launcher is shown.
 
 local function clamp(v, a, b)
 	if v < a then return a elseif v > b then return b end
@@ -136,16 +230,20 @@ local function wrapText(str, maxChars)
 	return table.concat(lines, "\n"), #lines
 end
 local function fire(cb, ...)
-	if not cb then return end
+	if type(cb) ~= "function" then return end
 	local args, count = { ... }, select("#", ...)
-	local schedule = task.defer or task.spawn
-	schedule(function() pcall(cb, unpackf(args, 1, count)) end)
+	background(function()
+		local ok, err = pcall(cb, unpackf(args, 1, count))
+		if not ok then report("Callback: " .. tostring(err)) end
+	end)
 end
 
 -- Cache host-facing Drawing writes. Animated values are still updated every frame.
+local drawingOpacity, drawingAdapters = 1, {}
 local function newDraw(kind, props)
 	local raw = Drawing.new(kind)
-	local cache, removed, measured = {}, false, nil
+	assert(raw, "Astra UI: Drawing.new failed for " .. tostring(kind))
+	local cache, removed, measured, unsupported = {}, false, nil, {}
 	local proxy = {}
 	setmetatable(proxy, {
 		__index = function(_, key)
@@ -155,7 +253,7 @@ local function newDraw(kind, props)
 				end
 			end
 			if key == "TextBounds" then
-				if not measured then measured = raw.TextBounds end
+				if not measured then measured = safeGet(raw, "TextBounds") end
 				return measured
 			end
 			if cache[key] ~= nil then return cache[key] end
@@ -172,12 +270,22 @@ local function newDraw(kind, props)
 					if old.R == value.R and old.G == value.G and old.B == value.B then return end
 				end
 			end
-			raw[key] = value
+			local target = key
+			if kind == "Text" and key == "Size" and HAS_FONTSIZE then target = "FontSize" end
+			if kind == "Square" and key == "Rounding" and HAS_CORNER then target = "Corner" end
+			if unsupported[target] then return end
+			local hostValue = key == "Transparency" and value * drawingOpacity or value
+			local ok = pcall(function() raw[target] = hostValue end)
+			if not ok then unsupported[target] = true; return end
 			cache[key] = value
 			if key == "Text" or key == "Size" or key == "Font" then measured = nil end
 		end,
 	})
 	for k, v in pairs(props or {}) do pcall(function() proxy[k] = v end) end
+	if HAS_T and cache.Transparency == nil then proxy.Transparency = 1 end
+    drawingAdapters[#drawingAdapters + 1] = function()
+        if not removed and HAS_T then pcall(function() raw.Transparency = (cache.Transparency or 1) * drawingOpacity end) end
+    end
 	return proxy
 end
 local function kill(d)
@@ -252,20 +360,35 @@ local function getKeyName(vk)
 	return VK_NAMES[vk] or string.format("0x%X", vk)
 end
 
-local Kirin = { Flags = {}, _watchers = {}, _alive = true, _windows = {}, _theme = Themes.Cosmos }
+local Kirin = { Version = "3.4.1", Flags = {}, _controls = {}, _watchers = {}, _alive = true, _windows = {}, _theme = Themes.Cosmos }
 
 function Kirin:Set(flag, value)
+	local control = self._controls[flag]
+	if control and not control.setting and not control.destroyed and control.handle.Set then
+		local current = control.handle.Get and control.handle:Get()
+		if current ~= value then control.handle:Set(value); return end
+	end
 	self.Flags[flag] = value
 	local cbs = self._watchers[flag]
 	if cbs then
-		for _, cb in ipairs(cbs) do fire(cb, value) end
+		for _, entry in ipairs(cbs) do if entry.live then fire(function() if entry.live then entry.callback(value) end end) end end
 	end
 end
 function Kirin:Get(flag) return self.Flags[flag] end
 function Kirin:Watch(flag, cb)
-	self._watchers[flag] = self._watchers[flag] or {}
-	table.insert(self._watchers[flag], cb)
+	assert(type(cb) == "function", "Astra UI: Watch needs a function")
+	local list = self._watchers[flag] or {}
+	self._watchers[flag] = list
+	local entry = { callback = cb, live = true }
+	list[#list + 1] = entry
+	return { Disconnect = function() entry.live = false end }
 end
+function Kirin:GetThemes() return { "Cosmos", "Nebula", "Supernova", "Aurora" } end
+function Kirin:SetTransparency(value)
+    drawingOpacity = 1 - clamp(finite(value, 0), 0, 0.6)
+    for _, update in ipairs(drawingAdapters) do update() end
+end
+function Kirin:Unload() self:Destroy() end
 function Kirin:SetTheme(name)
 	local t = Themes[name]
 	if not t then return end
@@ -328,7 +451,7 @@ function Kirin:Notify(cfg)
 	local body, lines = wrapText(tostring(cfg.Content or ""), 40)
 	local tag = (kind == "success" and "[ OK ]") or (kind == "warning" and "[ WARN ]") or (kind == "error" and "[ ERR ]") or "[ INFO ]"
 	local n = {
-		t0 = clock(), dur = cfg.Duration or 4, kind = kind, full = body, h = 42 + lines * 14,
+		t0 = clock(), dur = math.max(0.25, finite(cfg.Duration, 4)), kind = kind, full = body, h = 42 + lines * 14,
 		d = {
 			bg = newDraw("Square", { Filled = true, Rounding = 6 }),
 			ol = newDraw("Square", { Filled = false, Thickness = 1, Rounding = 6 }),
@@ -342,7 +465,7 @@ function Kirin:Notify(cfg)
 	}
 	table.insert(notifs, n)
 	if not notifConn then
-		notifConn = RunService.RenderStepped:Connect(function(dt)
+		notifConn = connectFrame(function(dt)
 			if not Kirin._alive or #notifs == 0 then
 				local old = notifConn
 				notifConn = nil
@@ -355,14 +478,16 @@ function Kirin:Notify(cfg)
 end
 
 function Kirin:CreateWindow(cfg)
+	assert(self._alive, "Astra UI: reload the library after Destroy")
+	refreshRuntime()
 	cfg = cfg or {}
 	local title = cfg.Title or "ASTRA"
 	local author = cfg.Author or "orbit build"
 	local T = Themes[cfg.Theme or "Cosmos"] or Themes.Cosmos
 	Kirin._theme = T
-	local togKey = cfg.ToggleKey or 0x79
-	local normalW = (cfg.Size and cfg.Size[1]) or 620
-	local normalH = (cfg.Size and cfg.Size[2]) or 470
+	local togKey = normalizeKey(cfg.ToggleKey or 0x79)
+	local normalW = clamp(finite(cfg.Size and cfg.Size[1], 620), 520, 920)
+	local normalH = clamp(finite(cfg.Size and cfg.Size[2], 470), 390, 720)
 	local MIN_W, MIN_H, MAX_W, MAX_H = 520, 390, 920, 720
 	local TITLE_H, SIDE_W, FOOT_H, HEAD_H = 42, 152, 26, 40
 	local W, H, tW, tH = normalW, normalH, normalW, normalH
@@ -371,11 +496,13 @@ function Kirin:CreateWindow(cfg)
 	local winY = math.floor((vp0.Y - H) / 2)
 
 	local visible, minimized, expanded = true, false, false
+	local windowAlive = true
 	local appear, miniAppear, lastAlpha = 0, 0, -1
 	local hiddenFlag = true
 	local dragging, dragDX, dragDY = false, 0, 0
 	local resizing, resDX, resDY = false, 0, 0
 	local scrollY, scrollTarget, maxScroll, scrollFlash = 0, 0, 0, 0
+	local scrollDragging, scrollGrab = false, 0
 	local cRect = { 0, 0, 0, 0 }
 	local miniX, miniY = 80, 130
 	local miniDrag, miniDX, miniDY, miniSX, miniSY = false, 0, 0, 0, 0
@@ -453,6 +580,100 @@ function Kirin:CreateWindow(cfg)
 	end
 	local shoot = { active = false, segs = {}, nextAt = clock() + 3 }
 	for k = 1, 7 do shoot.segs[k] = wd("Line", { Thickness = (k <= 2) and 2 or 1 }, false) end
+
+	    -- Celestial garden: fixed Drawing pool behind the existing controls.
+    local gardenEnabled = cfg.VisualFX ~= false
+    local gardenDraws, gardenNodes, gardenLinks, gardenOrbit, gardenCluster, gardenDust = {}, {}, {}, {}, {}, {}
+    local gardenAt, gardenDirty = -1, true
+    local gardenX, gardenY, gardenW, gardenH, gardenAlpha
+    local function gd(kind, props)
+        local d = wd(kind, props, false)
+        gardenDraws[#gardenDraws + 1] = d
+        return d
+    end
+    local gardenSeeds = { {0.56,0.20}, {0.69,0.12}, {0.84,0.23}, {0.77,0.39}, {0.62,0.44}, {0.48,0.31} }
+    for i = 1, 6 do gardenNodes[i] = gd("Circle", {Filled=true, Radius=1.5, NumSides=10}) end
+    for i = 1, 6 do gardenLinks[i] = gd("Line", {Thickness=1}) end
+    for i = 1, 20 do gardenOrbit[i] = gd("Line", {Thickness=1}) end
+    local gardenPlanet = gd("Circle", {Filled=true, NumSides=32})
+    local gardenShade = gd("Circle", {Filled=true, NumSides=32})
+    local gardenMoon = gd("Circle", {Filled=true, Radius=2, NumSides=12})
+    for i = 1, 7 do
+        gardenCluster[i] = {core=gd("Circle", {Filled=true, Radius=1.2, NumSides=10}), a=gd("Line", {Thickness=1}), b=gd("Line", {Thickness=1})}
+    end
+    for i = 1, 8 do gardenDust[i] = gd("Circle", {Filled=true, Radius=1, NumSides=8}) end
+    local function paintGarden(now, x, y, w, h, alpha)
+        if not gardenEnabled then return end
+        local moved = x ~= gardenX or y ~= gardenY or w ~= gardenW or h ~= gardenH or math.abs(alpha - (gardenAlpha or -1)) > 0.02
+        if not gardenDirty and not moved and now < gardenAt then return end
+        gardenAt, gardenDirty = now + 1/30, false
+        gardenX, gardenY, gardenW, gardenH, gardenAlpha = x, y, w, h, alpha
+        local points = {}
+        for i, seed in ipairs(gardenSeeds) do
+            local px = x + 8 + seed[1] * (w - 16) + math.sin(now * 0.16 + i) * 3
+            local py = y + 8 + seed[2] * (h - 16) + math.cos(now * 0.13 + i) * 3
+            points[i] = V(px, py)
+            local d = gardenNodes[i]
+            d.Position = points[i]; d.Color = mixC(T.Bg, T.AccentGlow, 0.42 + math.sin(now * 1.3 + i) * 0.12)
+            d.Visible = true; setA(d, alpha * 0.65)
+        end
+        for i, d in ipairs(gardenLinks) do
+            d.From = points[i]; d.To = points[i % 6 + 1]
+            d.Color = mixC(T.Bg, T.Accent, 0.28); d.Visible = true; setA(d, alpha * 0.4)
+        end
+        -- A small ringed world drifts above the footer, well inside the panel.
+        local pcx, pcy = x + w * 0.78, y + h * 0.78
+        local radius = math.min(28, h * 0.09)
+        gardenPlanet.Position = V(pcx, pcy); gardenPlanet.Radius = radius
+        gardenPlanet.Color = mixC(T.Bg, T.Neb, 0.28); gardenPlanet.Visible = true; setA(gardenPlanet, alpha * 0.7)
+        gardenShade.Position = V(pcx + radius * 0.35, pcy - radius * 0.2); gardenShade.Radius = radius * 0.7
+        gardenShade.Color = T.BgAlt; gardenShade.Visible = true; setA(gardenShade, alpha * 0.8)
+        local tilt = -0.35 + math.sin(now * 0.12) * 0.06
+        local ct, st = math.cos(tilt), math.sin(tilt)
+        local function orbitPoint(a)
+            local ox, oy = math.cos(a) * radius * 1.9, math.sin(a) * radius * 0.6
+            return V(pcx + ox * ct - oy * st, pcy + ox * st + oy * ct)
+        end
+        for i, d in ipairs(gardenOrbit) do
+            d.From = orbitPoint((i-1) * math.pi/10); d.To = orbitPoint(i * math.pi/10)
+            d.Color = mixC(T.Bg, T.Accent, 0.3); d.Visible = true; setA(d, alpha * 0.5)
+        end
+        gardenMoon.Position = orbitPoint(now * 0.4); gardenMoon.Color = mixC(T.Bg, T.AccentGlow, 0.7)
+        gardenMoon.Visible = true; setA(gardenMoon, alpha * 0.65)
+        -- A scattered stellar nursery and orbiting fragments replace the botanical silhouette.
+        local clusterX, clusterY = x + w * 0.19, y + h * 0.78
+        local clusterScale = math.min(1, h / 360)
+        for i, star in ipairs(gardenCluster) do
+            local angle = i * 2.399 + now * (i <= 4 and 0.018 or -0.09)
+            local radius = (16 + i * 5) * clusterScale
+            local px = clusterX + math.cos(angle) * radius
+            local py = clusterY + math.sin(angle) * radius * 0.67
+            local pulse = (math.sin(now * 1.1 + i * 1.7) + 1) * 0.5
+            local glint = (1.5 + pulse * pulse * 3) * clusterScale
+            star.core.Position = V(px, py); star.core.Radius = 0.8 + pulse * 0.6
+            star.core.Color = mixC(T.Bg, T.AccentGlow, 0.45 + pulse * 0.35)
+            if i <= 4 then
+                star.a.From = V(px-glint, py); star.a.To = V(px+glint, py)
+                star.b.From = V(px, py-glint); star.b.To = V(px, py+glint)
+            else
+                local spin, size = now * 0.22 + i, 2.5 * clusterScale
+                local dx, dy = math.cos(spin) * size, math.sin(spin) * size
+                star.a.From = V(px-dx, py-dy); star.a.To = V(px-dy, py+dx)
+                star.b.From = V(px-dy, py+dx); star.b.To = V(px+dx, py+dy)
+            end
+            star.core.Visible = true; setA(star.core, alpha * 0.75)
+            for _, d in ipairs({star.a, star.b}) do
+                d.Color = mixC(T.Bg, i <= 4 and T.AccentGlow or T.Neb, 0.3 + pulse * 0.25)
+                d.Visible = true; setA(d, alpha * 0.6)
+            end
+        end
+        for i, d in ipairs(gardenDust) do
+            local phase = (now * (0.018 + i * 0.001) + i * 0.137) % 1
+            d.Position = V(x + 12 + ((i * 0.113 + math.sin(now * 0.18 + i) * 0.03) % 1) * (w - 24), y + 12 + (1-phase) * (h-24))
+            d.Color = mixC(T.Bg, i % 2 == 0 and T.Ok or T.AccentGlow, 0.3 + math.sin(now+i) * 0.12)
+            d.Visible = true; setA(d, alpha * math.sin(phase * math.pi) * 0.6)
+        end
+    end
 
 	local titleBg = wd("Square", { Filled = true, Rounding = 10 })
 	local titleFill = wd("Square", { Filled = true })
@@ -548,7 +769,7 @@ function Kirin:CreateWindow(cfg)
 		}
 	end
 
-	local POLL = typeof(iskeypressed) == "function"
+	local POLL = typeOf(iskeypressed) == "function"
 	local TYPE_KEYS = {}
 	for i = 0x41, 0x5A do table.insert(TYPE_KEYS, i) end
 	for i = 0x30, 0x39 do table.insert(TYPE_KEYS, i) end
@@ -557,7 +778,7 @@ function Kirin:CreateWindow(cfg)
 	local PUNCT = { [0x20] = " ", [0xBD] = "-", [0xBE] = ".", [0xBC] = ",", [0xBF] = "/", [0xBA] = ";" }
 
 	local function keyEdge(vk)
-		local d = iskeypressed(vk)
+		local d = iskeypressed(vk) == true
 		local was = keyPrev[vk]
 		keyPrev[vk] = d
 		return d and not was
@@ -578,7 +799,7 @@ function Kirin:CreateWindow(cfg)
 		local el = activeInput
 		if not el then return end
 		if vk == 0x08 then
-			el.text = string.sub(el.text, 1, -2)
+			el.text = utf8Prefix(el.text, #el.text - 1)
 		elseif vk == 0x0D or vk == 0x1B then
 			finishInput()
 			return
@@ -624,6 +845,7 @@ function Kirin:CreateWindow(cfg)
 	end
 	local function pollKeys(now)
 		if not POLL then return end
+		if type(isrbxactive) == "function" and not isrbxactive() then return end
 		if activeCaptor then
 			if now - (activeCaptor.listenT or 0) > 0.12 then
 				for vk = 0x02, 0xFE do
@@ -643,10 +865,26 @@ function Kirin:CreateWindow(cfg)
 			return
 		end
 		if keyEdge(togKey) then toggleUI() end
+		for _, tab in ipairs(tabs) do
+			for _, el in ipairs(tab.elems) do
+				if el.type == "keybind" then
+					local down = el.key > 0 and iskeypressed(el.key) == true
+					local hit = down and not el.keyDown
+					el.keyDown = down
+					local value = el.enabled
+					if el.mode == "hold" then value = down elseif el.mode == "always" then value = true
+					elseif hit then value = el.mode == "click" and true or not value
+					elseif el.mode == "click" then value = false end
+					if value ~= el.enabled then el.enabled = value; fire(el.onTriggered, value, el.key) end
+				end
+			end
+		end
 	end
 	local function isDown()
-		if POLL then return iskeypressed(0x01) end
-		if typeof(ismouse1pressed) == "function" then
+		if type(isrbxactive) == "function" and not isrbxactive() then return false end
+		if type(ismouse1pressed) == "function" then return ismouse1pressed() == true end
+		if POLL then return iskeypressed(0x01) == true end
+		if typeOf(ismouse1pressed) == "function" then
 			local ok, r = pcall(ismouse1pressed)
 			if ok then return r end
 		end
@@ -710,26 +948,30 @@ function Kirin:CreateWindow(cfg)
 		if el.fitWidth == room and el.fitTitle == full then return end
 		el.fitWidth, el.fitTitle = room, full
 		d.Text = full
-		if textW(d, 14, false) <= room then return end
+		if textW(d, 15, false) <= room then return end
 		local lo, hi = 0, #full
 		while lo < hi do
 			local mid = math.floor((lo + hi + 1) / 2)
-			d.Text = string.sub(full, 1, mid) .. "..."
-			if textW(d, 14, false) <= room then lo = mid else hi = mid - 1 end
+			d.Text = utf8Prefix(full, mid) .. "..."
+			if textW(d, 15, false) <= room then lo = mid else hi = mid - 1 end
 		end
-		d.Text = lo > 0 and (string.sub(full, 1, lo) .. "...") or ""
+		d.Text = lo > 0 and (utf8Prefix(full, lo) .. "...") or ""
 	end
 
 	local function row(el, x, y, w, h, v, hot, dt)
 		el.hov = lerp(el.hov, hot and 1 or 0, math.min(dt * 14, 1))
-		local bgc = mixC(T.Surface, T.SurfaceHov, el.hov)
+		local bgc = mixC(T.Surface, el.danger and mixC(T.SurfaceHov, T.Error, 0.12) or T.SurfaceHov, el.hov)
 		local d = el.d
 		d.bg.Position = V(x, y); d.bg.Size = V(w, h); d.bg.Color = bgc; d.bg.Visible = v
 		d.outline.Position = V(x, y); d.outline.Size = V(w, h)
 		d.outline.Color = el.danger and T.Error or mixC(T.Border, T.AccentDim, el.hov)
 		d.outline.Visible = v
+		d.topLight.From = V(x + 10, y + 1); d.topLight.To = V(x + w - 10, y + 1)
+		d.topLight.Color = mixC(T.Surface, el.danger and T.Error or T.BorderLit, 0.3 + el.hov * 0.35); d.topLight.Visible = v
 		local iconY = (el.type == "slider" or el.type == "progressbar") and (y + 16) or (el.type == "input" and y + 18 or (el.type == "dropdown" and y + 18 or y + h / 2))
-		paintIcon(el.icon, x + 22, iconY, 14, el.danger and T.Error or T.Accent, v)
+		d.iconPlate.Position = V(x + 8, iconY - 12); d.iconPlate.Size = V(26, 24)
+		d.iconPlate.Color = mixC(T.BgAlt, el.danger and T.Error or T.AccentDim, 0.10 + el.hov * 0.16); d.iconPlate.Visible = v
+		paintIcon(el.icon, x + 21, iconY, 14, el.danger and T.Error or T.Accent, v)
 		local bh = (h - 16) * el.hov
 		d.bar.Position = V(x, y + h / 2 - bh / 2); d.bar.Size = V(2, bh); d.bar.Color = T.Accent; d.bar.Visible = v and el.hov > 0.06
 		d.lbl.Position = V(x + 38, y + math.floor((h - 15) / 2)); d.lbl.Color = T.Text; d.lbl.Visible = v
@@ -752,18 +994,14 @@ function Kirin:CreateWindow(cfg)
 		end
 		el.culled = false
 		if el.type == "header" then
-			local h = 28
+			local h = 32
 			local v = vis(y, h, cy, ch)
-			d.txt.Position = V(x + 2, y + 9); d.txt.Color = T.Accent; d.txt.Visible = v
-			local lx = x + 2 + textW(d.txt, 11, true) + 10
-			local ly = y + 16
-			d.line.From = V(lx, ly); d.line.To = V(x + w, ly); d.line.Color = T.Border; d.line.Visible = v and lx < x + w
-			for i, tk in ipairs(el.ticks) do
-				local tx = lx + (i - 1) * 22
-				tk.From = V(tx, ly); tk.To = V(tx, ly - ((i == 1) and 5 or 3))
-				tk.Color = (i == 1) and T.Accent or T.Border
-				tk.Visible = v and tx <= x + w
-			end
+			d.plaque.Position = V(x, y + 4); d.plaque.Size = V(w, 26); d.plaque.Color = T.BgAlt; d.plaque.Visible = v
+			d.mark.Position = V(x + 9, y + 17); d.mark.Color = T.Accent; d.mark.Visible = v
+			d.txt.Position = V(x + 20, y + 9); d.txt.Color = T.TextSub; d.txt.Visible = v
+			local lx = x + 20 + textW(d.txt, 13, false) + 12
+			d.line.From = V(lx, y + 17); d.line.To = V(x + w - 12, y + 17)
+			d.line.Color = T.Border; d.line.Visible = v and lx < x + w - 12
 			return h
 
 		elseif el.type == "toggle" then
@@ -852,6 +1090,9 @@ function Kirin:CreateWindow(cfg)
 				fire(el.callback)
 			end
 			local bgc = row(el, x, y, w, h, v, hot, dt)
+			if el.primary then d.bg.Color = mixC(bgc, T.AccentDim, 0.14 + el.hov * 0.09); d.outline.Color = T.AccentDim end
+			d.action.Position = V(x + w - 33, y + 10); d.action.Size = V(24, h - 20)
+			d.action.Color = mixC(T.BgAlt, el.danger and T.Error or T.AccentDim, 0.15 + el.hov * 0.25); d.action.Visible = v
 			el.flashT = math.max(0, el.flashT - dt * 2.2)
 			if el.flashT > 0.01 then
 				local half = w * easeOut(1 - el.flashT)
@@ -863,7 +1104,7 @@ function Kirin:CreateWindow(cfg)
 			else
 				d.flash.Visible = false
 			end
-			d.arrow.Position = V(x + w - 26 + el.hov * 5, y + h / 2 - 7)
+			d.arrow.Position = V(x + w - 25, y + h / 2 - 7)
 			d.arrow.Color = mixC(T.TextDim, T.Accent, el.hov); d.arrow.Visible = v
 			return h
 
@@ -957,7 +1198,7 @@ function Kirin:CreateWindow(cfg)
 			end
 			local kx = x + w - 14 - kw
 			d.badge.Position = V(kx, y + 12); d.badge.Size = V(kw, 20); d.badge.Color = el.listening and T.SurfaceAct or T.BgAlt; d.badge.Visible = v
-			d.outline.Position = V(kx, y + 12); d.outline.Size = V(kw, 20); d.outline.Color = el.listening and T.Accent or T.Border; d.outline.Visible = v
+			d.badgeOutline.Position = V(kx, y + 12); d.badgeOutline.Size = V(kw, 20); d.badgeOutline.Color = el.listening and T.Accent or T.Border; d.badgeOutline.Visible = v
 			d.key.Position = V(kx + kw / 2, y + 15); d.key.Color = el.listening and T.Accent or T.Text; d.key.Visible = v
 			d.mode.Text = string.lower(el.mode)
 			d.mode.Position = V(kx - 10 - textW(d.mode, 10, true), y + 16); d.mode.Color = T.TextDim; d.mode.Visible = v
@@ -1249,6 +1490,7 @@ function Kirin:CreateWindow(cfg)
 			n.d.Visible = true
 		end
 
+		paintGarden(now, areaX + 4, areaY + 4, areaW - 8, areaH - 8, e)
 		local pmx = clamp((mx - (X + w / 2)) / w, -1, 1)
 		local pmy = clamp((my - (Y + h / 2)) / h, -1, 1)
 		local sw, sh = math.max(areaW - 12, 1), math.max(areaH - 12, 1)
@@ -1407,6 +1649,7 @@ function Kirin:CreateWindow(cfg)
 					activeTab = tab
 					isA = true
 					scrollY, scrollTarget = 0, 0
+					scrollDragging = false
 					contentSlide, typeT, typeStart = 1, 0, now
 				end
 				tab.hov = lerp(tab.hov, hot and 1 or 0, math.min(dt * 14, 1))
@@ -1450,37 +1693,69 @@ function Kirin:CreateWindow(cfg)
 		local cy = Y + TITLE_H + HEAD_H + 12
 		local ch = h - TITLE_H - HEAD_H - FOOT_H - 18
 		cRect[1], cRect[2], cRect[3], cRect[4] = cx, cy, cw, ch
-		if POLL and live and not activeInput then
-			if iskeypressed(0x21) then scrollTarget = scrollTarget - 700 * dt; scrollFlash = 1 end
-			if iskeypressed(0x22) then scrollTarget = scrollTarget + 700 * dt; scrollFlash = 1 end
-		end
-		scrollTarget = clamp(scrollTarget, 0, maxScroll)
-		scrollY = lerp(scrollY, scrollTarget, math.min(dt * 40, 1))
-		if math.abs(scrollY - scrollTarget) < 0.15 then scrollY = scrollTarget end
-		local inContent = live and inRect(mx, my, cx, cy, cw, ch)
-		if activeTab then
-			local ox = math.floor(contentSlide * 16)
-			local yy = cy - scrollY
-			local total = 0
-			for _, el in ipairs(activeTab.elems) do
-				local eh = renderElem(el, cx + ox, yy, cw, cy, ch, now, dt, mx, my, down, clicked and inContent, clicked and live, inContent)
-				yy = yy + eh + 6
-				total = total + eh + 6
-			end
-			maxScroll = math.max(0, total - 6 - ch)
-		end
 
-		scrollFlash = math.max(0, scrollFlash - dt * 1.5)
-		local sbx = cx + cw + 9
-		if maxScroll > 1 then
-			local th = math.max(26, ch * ch / (ch + maxScroll))
-			local ty = cy + (ch - th) * clamp(scrollY / maxScroll, 0, 1)
-			scrollTrack.From = V(sbx, cy); scrollTrack.To = V(sbx, cy + ch); scrollTrack.Color = mixC(T.Bg, T.Border, 0.7); scrollTrack.Visible = true
-			scrollThumb.Position = V(sbx - 1.5, ty); scrollThumb.Size = V(3, th); scrollThumb.Color = mixC(T.BorderLit, T.Accent, scrollFlash); scrollThumb.Visible = true
-		else
-			scrollTrack.Visible = false
-			scrollThumb.Visible = false
-		end
+        -- Measure before handling input so tabs, resizing and dynamic lists clamp immediately.
+        local totalHeight = 0
+        if activeTab then
+            for _, el in ipairs(activeTab.elems) do
+                local eh = el.height
+                if el.type == "dropdown" then eh = 62 + math.floor((#el.options * 32 + 6) * el.o + 0.5) + (el.o > 0.01 and 4 or 0) end
+                if el.type == "colorpicker" then eh = 44 + math.floor(34 * el.o + 0.5) end
+                totalHeight = totalHeight + eh + 6
+            end
+        end
+        maxScroll = math.max(0, totalHeight - 6 - ch)
+        scrollTarget = clamp(scrollTarget, 0, maxScroll)
+        scrollY = clamp(scrollY, 0, maxScroll)
+        local sbx = cx + cw + 9
+        local th = math.min(ch, math.max(26, ch * ch / (ch + maxScroll)))
+        local travel = math.max(0, ch - th)
+        local ty = cy + travel * (maxScroll > 0 and scrollY / maxScroll or 0)
+        local scrollHot = live and maxScroll > 1 and inRect(mx, my, sbx - 8, cy, 16, ch)
+        if not live or maxScroll <= 1 or resizing or dragging then scrollDragging = false end
+        if scrollHot and clicked and not resizing and not dragging then
+            scrollDragging = true
+            -- Track clicks place the thumb under the pointer; thumb clicks preserve the grip.
+            scrollGrab = inRect(mx, my, sbx - 8, ty, 16, th) and (my - ty) or th / 2
+            clicked = false
+        end
+        if scrollDragging then
+            if down and live then
+                scrollTarget = travel > 0 and clamp((my - cy - scrollGrab) / travel, 0, 1) * maxScroll or 0
+                scrollY = scrollTarget -- no interpolation while the pointer owns the thumb
+                scrollFlash = 1
+            else scrollDragging = false end
+        end
+        if POLL and live and not activeInput and not scrollDragging and inRect(mx, my, cx, cy, cw + 18, ch) then
+            if iskeypressed(0x21) then scrollTarget = scrollTarget - 700 * dt; scrollFlash = 1 end
+            if iskeypressed(0x22) then scrollTarget = scrollTarget + 700 * dt; scrollFlash = 1 end
+        end
+        scrollTarget = clamp(scrollTarget, 0, maxScroll)
+        if not scrollDragging then scrollY = lerp(scrollY, scrollTarget, math.min(dt * 40, 1)) end
+        if math.abs(scrollY - scrollTarget) < 0.15 then scrollY = scrollTarget end
+        local inContent = live and not scrollDragging and inRect(mx, my, cx, cy, cw, ch)
+        if activeTab then
+            local ox = math.floor(contentSlide * 16)
+            local yy, total = cy - scrollY, 0
+            for _, el in ipairs(activeTab.elems) do
+                local eh = renderElem(el, cx + ox, yy, cw, cy, ch, now, dt, mx, my, down, clicked and inContent, clicked and live and not scrollDragging, inContent)
+                yy, total = yy + eh + 6, total + eh + 6
+            end
+            maxScroll = math.max(0, total - 6 - ch)
+            scrollTarget, scrollY = clamp(scrollTarget, 0, maxScroll), clamp(scrollY, 0, maxScroll)
+        end
+        scrollFlash = math.max(0, scrollFlash - dt * 1.5)
+        if maxScroll > 1 then
+            th = math.min(ch, math.max(26, ch * ch / (ch + maxScroll)))
+            ty = cy + (ch - th) * clamp(scrollY / maxScroll, 0, 1)
+            local sw = (scrollHot or scrollDragging) and 5 or 3
+            scrollTrack.From = V(sbx, cy); scrollTrack.To = V(sbx, cy + ch); scrollTrack.Color = mixC(T.Bg, T.Border, 0.7); scrollTrack.Visible = true
+            scrollThumb.Position = V(sbx - sw / 2, ty); scrollThumb.Size = V(sw, th)
+            scrollThumb.Color = mixC(T.BorderLit, T.Accent, math.max(scrollFlash, (scrollHot or scrollDragging) and 1 or 0)); scrollThumb.Visible = true
+        else
+            scrollDragging = false
+            scrollTrack.Visible = false; scrollThumb.Visible = false
+        end
 
 		local fy = Y + h - FOOT_H
 		footBg.Position = V(X, fy); footBg.Size = V(w, FOOT_H); footBg.Color = T.Panel; footBg.Visible = true
@@ -1521,10 +1796,11 @@ function Kirin:CreateWindow(cfg)
 		end
 	end
 
-	table.insert(conns, RunService.RenderStepped:Connect(function(rdt)
-		if not Kirin._alive then return end
+	table.insert(conns, connectFrame(function(rdt)
+		if not Kirin._alive or not windowAlive then return end
 		local ok, err = pcall(function()
-			local dt = math.min(rdt or 0.016, 0.05)
+			refreshRuntime()
+			local dt = clamp(finite(rdt, 0.016), 0.001, 0.05)
 			local now = clock()
 			frames = frames + 1
 			if now - fpsT >= 0.5 then
@@ -1568,7 +1844,7 @@ function Kirin:CreateWindow(cfg)
 		local now = clock()
 		if now - lastWheel < 0.01 then return end
 		lastWheel = now
-		if not visible or minimized then return end
+		if not visible or minimized or scrollDragging then return end
 		local mx, my = (mouse and mouse.X) or 0, (mouse and mouse.Y) or 0
 		if not inRect(mx, my, cRect[1], cRect[2], cRect[3] + 16, cRect[4]) then return end
 		scrollTarget = clamp(scrollTarget - z * 44, 0, maxScroll)
@@ -1588,13 +1864,13 @@ function Kirin:CreateWindow(cfg)
 		pcall(function()
 			table.insert(conns, UserInputService.InputBegan:Connect(function(input)
 				pcall(function()
-					local code = input.KeyCode
+					local code = normalizeKey(input.KeyCode)
 					if activeCaptor then
 						captureKey(code)
 						return
 					end
 					if activeInput then
-						local ch = input.Character or VK_NAMES[code]
+						local ch = safeGet(input, "Character") or (code == 32 and " " or VK_NAMES[code])
 						if code == 0x08 then
 							typeKey(0x08, false)
 						elseif code == 0x0D or code == 0x1B then
@@ -1624,6 +1900,10 @@ function Kirin:CreateWindow(cfg)
 		return d
 	end
 	local function removeElem(tab, el)
+		el.destroyed = true
+		if el.flag then Kirin._controls[el.flag] = nil; Kirin.Flags[el.flag] = nil end
+		if activeInput == el then activeInput = nil end
+		if activeCaptor == el then activeCaptor = nil end
 		local removed = {}
 		for _, d in ipairs(el.all) do removed[d] = true; kill(d) end
 		for i = #winList, 1, -1 do if removed[winList[i]] then table.remove(winList, i) end end
@@ -1635,11 +1915,74 @@ function Kirin:CreateWindow(cfg)
 			end
 		end
 	end
+	local function bindControl(tab, el, handle)
+		el.handle = handle
+		local originalSet = handle.Set
+		if originalSet then
+			function handle:Set(value)
+				if el.destroyed or not windowAlive then return self end
+				if el.type == "slider" then
+					value = finite(value, el.value)
+					value = clamp(el.min + math.floor((value - el.min) / el.step + 0.5) * el.step, el.min, el.max)
+				elseif el.type == "toggle" then value = value == true
+				elseif el.type == "input" then value = tostring(value or "")
+				elseif el.type == "keybind" then value = normalizeKey(value)
+				elseif el.type == "colorpicker" then if not colorValid(value) then return self end
+				elseif el.type == "dropdown" then
+					if el.multi then
+						local selected = {}
+						for _, option in ipairs(el.options) do
+							if type(value) == "table" then
+								if value[option] == true then selected[option] = true end
+								for _, entry in ipairs(value) do if entry == option then selected[option] = true end end
+							end
+						end
+						value = selected
+					else
+						local found = false
+						for _, option in ipairs(el.options) do if option == value then found = true end end
+						if not found then value = el.options[1] end
+					end
+				end
+				el.setting = true
+				originalSet(self, value)
+				el.setting = false
+				if el.type == "keybind" or el.type == "colorpicker" or el.type == "input" then fire(el.callback, value) end
+				return self
+			end
+		end
+		if handle.SetProgress then
+			local setProgress = handle.SetProgress
+			function handle:SetProgress(value) if not el.destroyed then setProgress(self, finite(value, el.progress)) end; return self end
+			handle.Set, handle.Get = handle.SetProgress, handle.GetProgress
+		end
+		function handle:SetTitle(value)
+			if el.destroyed then return self end
+			el.fullTitle, el.fitWidth = tostring(value or ""), nil
+			if el.d.lbl then el.d.lbl.Text = el.fullTitle elseif el.d.txt then el.d.txt.Text = el.fullTitle end
+			return self
+		end
+		function handle:OnChanged(callback) el.callback = type(callback) == "function" and callback or nil; return self end
+		function handle:Destroy() if not el.destroyed then removeElem(tab, el) end end
+		if el.type == "keybind" then
+			function handle:IsEnabled() return el.enabled == true end
+			function handle:OnTriggered(callback) el.onTriggered = callback; return self end
+		end
+		if el.flag then
+			assert(not Kirin._controls[el.flag], "Astra UI: duplicate Flag '" .. tostring(el.flag) .. "'")
+			Kirin._controls[el.flag] = el
+		end
+		return handle
+	end
+
+
 	local function lbl(el, text)
 		el.fullTitle = tostring(text)
+		add(el, "iconPlate", "Square", { Filled = true, Rounding = 6 })
 		el.icon = makeIcon(el.iconName or el.type, function(kind, props) return add(el, nil, kind, props) end)
-		add(el, "outline", "Square", { Filled = false, Thickness = 1, Rounding = 6 })
-		return add(el, "lbl", "Text", { Text = el.fullTitle, Size = 14, Font = F_BOLD, Outline = true })
+		add(el, "outline", "Square", { Filled = false, Thickness = 1, Rounding = 7 })
+		add(el, "topLight", "Line", { Thickness = 1 })
+		return add(el, "lbl", "Text", { Text = el.fullTitle, Size = 15, Font = F_BOLD, Outline = false })
 	end
 	local function rowBase(el)
 		add(el, "bg", "Square", { Filled = true, Rounding = 5 })
@@ -1674,21 +2017,24 @@ function Kirin:CreateWindow(cfg)
 			local API = {}
 
 			function API:Section(name)
-				local el = newElem(tab, "header", 28)
-				add(el, "txt", "Text", { Text = "// " .. string.upper(tostring(name)), Size = 11, Font = F_MONO, Outline = true })
+				local el = newElem(tab, "header", 32)
+				add(el, "plaque", "Square", { Filled = true, Rounding = 5 })
+				add(el, "mark", "Circle", { Filled = true, Radius = 2, NumSides = 12 })
+				add(el, "txt", "Text", { Text = tostring(name), Size = 13, Font = F_BOLD, Outline = false })
 				add(el, "line", "Line", { Thickness = 1 })
-				el.ticks = {}
-				for i = 1, 30 do el.ticks[i] = add(el, nil, "Line", { Thickness = 1 }) end
 			end
 
 			function API:Toggle(c)
 				if type(c) == "string" then c = { Title = c } end
 				c = c or {}
+                assert(not c.Flag or not Kirin._controls[c.Flag], "Astra UI: duplicate Flag " .. tostring(c.Flag))
+                assert(not c.Flag or not Kirin._controls[c.Flag], "Astra UI: duplicate Flag " .. tostring(c.Flag))
 				local el = newElem(tab, "toggle", 44)
 				el.variant = c.Type or "Switch"
 				el.value = c.Default == true
 				el.t = el.value and 1 or 0
 				el.flag, el.callback = c.Flag, c.Callback
+				el.iconName = c.Icon
 				rowBase(el)
 				if el.variant == "Checkbox" then
 					add(el, "box", "Square", { Filled = false, Thickness = 1.5, Rounding = 3 })
@@ -1711,17 +2057,20 @@ function Kirin:CreateWindow(cfg)
 				function hd:OnChanged(fn) el.callback = fn end
 				function hd:SetTitle(t) el.fullTitle = tostring(t); el.fitWidth = nil; el.d.lbl.Text = el.fullTitle end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Slider(c, pMin, pMax, pDef, pCb)
 				if type(c) == "string" then c = { Title = c, Min = pMin, Max = pMax, Default = pDef, Callback = pCb } end
 				c = c or {}
 				local el = newElem(tab, "slider", 60)
-				el.min, el.max, el.step = c.Min or 0, c.Max or 100, c.Step or 1
-				el.value = clamp(c.Default or el.min, el.min, el.max)
+				el.min, el.max = finite(c.Min, 0), finite(c.Max, 100)
+				if el.min > el.max then el.min, el.max = el.max, el.min end
+				el.step = finite(c.Step, 1); if el.step <= 0 then el.step = 1 end
+				el.value = clamp(finite(c.Default, el.min), el.min, el.max)
 				el.suffix = c.Suffix or ""
 				el.flag, el.callback = c.Flag, c.Callback
+				el.iconName = c.Icon
 				el.sliding = false
 				el.disp = (el.value - el.min) / math.max(el.max - el.min, 1e-9)
 				rowBase(el)
@@ -1744,7 +2093,7 @@ function Kirin:CreateWindow(cfg)
 				function hd:Get() return el.value end
 				function hd:OnChanged(fn) el.callback = fn end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Button(c)
@@ -1753,24 +2102,28 @@ function Kirin:CreateWindow(cfg)
 				local el = newElem(tab, "button", 44)
 				el.iconName = c.Icon or "button"
 				el.danger = c.Style == "danger"
+				el.primary = c.Style == "primary"
 				el.callback = c.Callback
 				el.flashT, el.flashX = 0, 0
 				add(el, "bg", "Square", { Filled = true, Rounding = 5 })
 				add(el, "flash", "Square", { Filled = true, Rounding = 5 })
 				add(el, "bar", "Square", { Filled = true, Rounding = 1 })
+				add(el, "action", "Square", { Filled = true, Rounding = 5 })
 				add(el, "arrow", "Text", { Text = ">", Size = 13, Font = F_MONO, Outline = true })
 				lbl(el, c.Title or "Button")
 				local hd = {}
 				function hd:SetTitle(t) el.fullTitle = tostring(t); el.fitWidth = nil; el.d.lbl.Text = el.fullTitle end
 				function hd:Fire() fire(el.callback) end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Dropdown(c)
 				c = c or {}
+                assert(not c.Flag or not Kirin._controls[c.Flag], "Astra UI: duplicate Flag " .. tostring(c.Flag))
 				local el = newElem(tab, "dropdown", 62)
-				el.options = c.Options or { "Option A", "Option B" }
+				el.options = {}
+				for _, option in ipairs(type(c.Options) == "table" and c.Options or { "Option A", "Option B" }) do el.options[#el.options + 1] = tostring(option) end
 				el.multi = c.Multi == true
 				if el.multi then
 					el.selected = {}
@@ -1780,12 +2133,19 @@ function Kirin:CreateWindow(cfg)
 						end
 					end
 				else
-					el.selected = c.Default or el.options[1]
+					el.selected = el.options[1]
+                    for _, option in ipairs(el.options) do if option == c.Default then el.selected = option end end
 				end
-				el.open, el.o = false, 0
-				el.flag, el.callback = c.Flag, c.Callback
-				rowBase(el)
-				add(el, "val", "Text", { Text = "", Size = 11, Font = F_MONO, Outline = true })
+				if el.multi then
+                    local filtered = {}
+                    for _, option in ipairs(el.options) do if el.selected[option] then filtered[option] = true end end
+                    el.selected = filtered
+                end
+                el.open, el.o = false, 0
+                el.flag, el.callback = c.Flag, c.Callback
+                el.iconName = c.Icon
+                rowBase(el)
+                add(el, "val", "Text", { Text = "", Size = 11, Font = F_MONO, Outline = true })
 				add(el, "chev", "Text", { Text = "v", Size = 11, Font = F_MONO, Outline = true })
 				lbl(el, c.Title or "Dropdown")
 				add(el, "list", "Square", { Filled = true, Rounding = 5 })
@@ -1807,20 +2167,25 @@ function Kirin:CreateWindow(cfg)
 				end
 				function hd:Get() return el.selected end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Keybind(c)
 				c = c or {}
+                assert(not c.Flag or not Kirin._controls[c.Flag], "Astra UI: duplicate Flag " .. tostring(c.Flag))
 				local el = newElem(tab, "keybind", 44)
-				el.key = c.Default or 0
-				el.mode = c.Mode or "toggle"
+				el.key = normalizeKey(c.Default or 0)
+				el.mode = string.lower(tostring(c.Mode or "toggle"))
+				if el.mode ~= "hold" and el.mode ~= "always" and el.mode ~= "click" then el.mode = "toggle" end
+				el.enabled, el.keyDown = false, false
+				el.onTriggered = c.OnTriggered
 				el.listening = false
 				el.flag, el.callback = c.Flag, c.Callback
+				el.iconName = c.Icon
 				rowBase(el)
 				add(el, "mode", "Text", { Text = "", Size = 10, Font = F_MONO, Outline = true })
 				add(el, "badge", "Square", { Filled = true, Rounding = 4 })
-				add(el, "outline", "Square", { Filled = false, Thickness = 1, Rounding = 4 })
+				add(el, "badgeOutline", "Square", { Filled = false, Thickness = 1, Rounding = 4 })
 				add(el, "key", "Text", { Text = "", Size = 11, Font = F_MONO, Center = true, Outline = true })
 				lbl(el, c.Title or "Keybind")
 				if el.flag then Kirin.Flags[el.flag] = el.key end
@@ -1831,22 +2196,28 @@ function Kirin:CreateWindow(cfg)
 				end
 				function hd:Get() return el.key end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Colorpicker(c)
 				c = c or {}
+                assert(not c.Flag or not Kirin._controls[c.Flag], "Astra UI: duplicate Flag " .. tostring(c.Flag))
 				local el = newElem(tab, "colorpicker", 44)
-				el.color = c.Default or T.Accent
-				el.presets = c.Presets or {
+				el.color = colorValid(c.Default) and c.Default or T.Accent
+				el.presets = type(c.Presets) == "table" and c.Presets or {
 					Color3.fromRGB(92, 214, 255), Color3.fromRGB(204, 136, 255), Color3.fromRGB(255, 168, 72),
 					Color3.fromRGB(84, 245, 178), Color3.fromRGB(255, 92, 104), Color3.fromRGB(255, 226, 120),
 					Color3.fromRGB(255, 255, 255), Color3.fromRGB(40, 46, 70),
 				}
-				el.open, el.o = false, 0
-				el.flag, el.callback = c.Flag, c.Callback
-				rowBase(el)
-				add(el, "hex", "Text", { Text = "", Size = 10, Font = F_MONO, Outline = true })
+				local presets = {}
+                for _, color in ipairs(el.presets) do if colorValid(color) then presets[#presets + 1] = color end end
+                if #presets == 0 then presets[1] = el.color end
+                el.presets = presets
+                el.open, el.o = false, 0
+                el.flag, el.callback = c.Flag, c.Callback
+                el.iconName = c.Icon
+                rowBase(el)
+                add(el, "hex", "Text", { Text = "", Size = 10, Font = F_MONO, Outline = true })
 				add(el, "swOut", "Square", { Filled = false, Thickness = 1, Rounding = 4 })
 				add(el, "sw", "Square", { Filled = true, Rounding = 3 })
 				lbl(el, c.Title or "Color")
@@ -1865,16 +2236,18 @@ function Kirin:CreateWindow(cfg)
 				end
 				function hd:Get() return el.color end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Input(c)
 				c = c or {}
+                assert(not c.Flag or not Kirin._controls[c.Flag], "Astra UI: duplicate Flag " .. tostring(c.Flag))
 				local el = newElem(tab, "input", 76)
-				el.text = c.Default or ""
-				el.placeholder = c.Placeholder or "type here"
+				el.text = tostring(c.Default or "")
+				el.placeholder = tostring(c.Placeholder or "type here")
 				el.focused, el.f = false, 0
 				el.flag, el.callback = c.Flag, c.Callback
+				el.iconName = c.Icon
 				rowBase(el)
 				add(el, "box", "Square", { Filled = true, Rounding = 4 })
 				add(el, "boxOl", "Square", { Filled = false, Thickness = 1, Rounding = 4 })
@@ -1888,13 +2261,13 @@ function Kirin:CreateWindow(cfg)
 				end
 				function hd:Get() return el.text end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Progressbar(c)
 				c = c or {}
 				local el = newElem(tab, "progressbar", 54)
-				el.progress = clamp(c.Default or 0, 0, 1)
+				el.progress = clamp(finite(c.Default, 0), 0, 1)
 				el.disp = el.progress
 				rowBase(el)
 				add(el, "pct", "Text", { Text = "0%", Size = 11, Font = F_MONO, Outline = true })
@@ -1906,7 +2279,7 @@ function Kirin:CreateWindow(cfg)
 				function hd:SetProgress(p) el.progress = clamp(p, 0, 1) end
 				function hd:GetProgress() return el.progress end
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Paragraph(c)
@@ -1918,7 +2291,7 @@ function Kirin:CreateWindow(cfg)
 				add(el, "txt", "Text", { Text = text, Size = 12, Font = F_UI, Outline = true })
 				local hd = {}
 				function hd:Destroy() removeElem(tab, el) end
-				return hd
+				return bindControl(tab, el, hd)
 			end
 
 			function API:Divider()
@@ -1932,6 +2305,11 @@ function Kirin:CreateWindow(cfg)
 				newElem(tab, "space", px or 8)
 			end
 
+            function API:Select()
+                if activeTab ~= tab then hideTab(activeTab); activeTab = tab end
+                scrollY, scrollTarget, scrollDragging = 0, 0, false
+                contentSlide, typeT, typeStart = 1, 0, clock()
+            end
 			return API
 		end
 
@@ -1939,9 +2317,9 @@ function Kirin:CreateWindow(cfg)
 	end
 
 	function Window:SetIcon(src)
-		task.spawn(function()
+		background(function()
 			local d = fetchImage(src)
-			if d then
+			if d and windowAlive then
 				iconData = d
 				miniImgSet = false
 			end
@@ -1953,7 +2331,12 @@ function Kirin:CreateWindow(cfg)
 		visible = true
 	end
 	function Window:Toggle() toggleUI() end
-	function Window:SetToggleKey(vk) togKey = vk end
+	function Window:IsPointerOver(mx, my)
+        if not windowAlive or not visible then return false end
+        if minimized then return (mx - miniX) ^ 2 + (my - miniY) ^ 2 <= 42 ^ 2 end
+        return inRect(mx, my, winX - 10, winY - 10, W + 20, H + 20)
+    end
+    function Window:SetToggleKey(vk) togKey = normalizeKey(vk) end
 	function Window:ToggleExpand()
 		expanded = not expanded
 		if expanded then
@@ -1963,13 +2346,20 @@ function Kirin:CreateWindow(cfg)
 		end
 	end
 	function Window:SetSize(nw, nh)
-		normalW = clamp(nw or normalW, MIN_W, MAX_W)
-		normalH = clamp(nh or normalH, MIN_H, MAX_H)
+		normalW = clamp(finite(nw, normalW), MIN_W, MAX_W)
+		normalH = clamp(finite(nh, normalH), MIN_H, MAX_H)
 		tW, tH = normalW, normalH
 		expanded = false
 	end
-	function Window:_applyTheme(nt)
+	function Window:SetVisualFX(enabled)
+        gardenEnabled = enabled ~= false
+        gardenDirty = true
+        if not gardenEnabled then for _, d in ipairs(gardenDraws) do d.Visible = false end end
+    end
+    function Window:GetVisualFX() return gardenEnabled end
+    function Window:_applyTheme(nt)
 		T = nt
+		gardenDirty = true
 		Window._theme = nt
 	end
 
@@ -1985,8 +2375,8 @@ function Kirin:CreateWindow(cfg)
 		local list = { bg, ol, acc, dot, nm, info }
 		local shownWM = true
 		local dateAt, dateText = -1, ""
-		local conn = RunService.RenderStepped:Connect(function()
-			if not Kirin._alive then return end
+		local conn = connectFrame(function()
+			if not Kirin._alive or not windowAlive then return end
 			pcall(function()
 				local now = clock()
 				if math.floor(now) ~= dateAt then
@@ -2021,8 +2411,17 @@ function Kirin:CreateWindow(cfg)
 		return hd
 	end
 
+	function Window:IsAlive() return windowAlive and Kirin._alive end
 	function Window:Destroy()
-		Kirin._alive = false
+		if not windowAlive then return end
+		windowAlive = false
+		for _, tab in ipairs(tabs) do
+			for _, el in ipairs(tab.elems) do
+				el.destroyed = true
+				if el.flag then Kirin._controls[el.flag] = nil; Kirin.Flags[el.flag] = nil end
+			end
+		end
+		for i = #Kirin._windows, 1, -1 do if Kirin._windows[i] == Window then table.remove(Kirin._windows, i) end end
 		for _, cn in ipairs(conns) do pcall(function() cn:Disconnect() end) end
 		for _, wm in ipairs(watermarks) do
 			pcall(function() wm.conn:Disconnect() end)
@@ -2046,166 +2445,14 @@ function Kirin:CreateWindow(cfg)
 end
 
 function Kirin:Destroy()
-	for _, w in ipairs(self._windows) do pcall(function() w:Destroy() end) end
-	self._windows = {}
+	for i = #self._windows, 1, -1 do pcall(function() self._windows[i]:Destroy() end) end
+	self._windows, self._controls, self._watchers = {}, {}, {}
 	self._alive = false
+	runtimeAlive = false
 end
 
 _G.__AstraCleanup = function() Kirin:Destroy() end
 _G.Kirin = Kirin
-if typeof(getgenv) == "function" then pcall(function() getgenv().Kirin = Kirin end) end
+if typeOf(getgenv) == "function" then pcall(function() getgenv().Kirin = Kirin end) end
 
-local Window = Kirin:CreateWindow({
-	Title = "ASTRA COSMOS",
-	Author = "rev 3.2 // responsive controls",
-	Theme = "Cosmos",
-	Size = { 640, 480 },
-	ToggleKey = 0x79,
-})
-
-local Mark = Window:Watermark({ Title = "ASTRA" })
-
-local Orbital = Window:Section({ Title = "Orbital" })
-local FlightTab = Orbital:Tab({ Title = "Navigation" })
-local VisualTab = Orbital:Tab({ Title = "Planetary" })
-
-local Vessel = Window:Section({ Title = "Vessel" })
-local ShipTab = Vessel:Tab({ Title = "Engine" })
-
-local SystemSec = Window:Section({ Title = "System" })
-local SystemTab = SystemSec:Tab({ Title = "Settings" })
-
-local function humanoid()
-	local c = lp and lp.Character
-	return c and c:FindFirstChildOfClass("Humanoid")
-end
-
-FlightTab:Section("Trajectory")
-FlightTab:Toggle({ Title = "Zero-G Propulsion", Default = true, Flag = "propulsion_zero_g" })
-FlightTab:Toggle({ Title = "Collision Deflector", Type = "Checkbox", Default = false, Flag = "ship_deflector" })
-FlightTab:Slider({ Title = "Impulse Velocity", Min = 10, Max = 500, Default = 140, Step = 5, Suffix = " km/s", Flag = "impulse_spd" })
-FlightTab:Slider({ Title = "Orbit Elevation", Min = 50, Max = 2000, Default = 450, Step = 25, Suffix = " m", Flag = "orbit_alt" })
-FlightTab:Dropdown({
-	Title = "Target Body",
-	Options = { "Earth Orbit", "Mars Colony", "Saturn Rings", "Jupiter Deep", "Nebula Void" },
-	Default = "Saturn Rings",
-	Flag = "target_planet",
-})
-FlightTab:Keybind({ Title = "Warp Drive", Default = 0x45, Mode = "hold", Flag = "warp_key" })
-FlightTab:Paragraph("Course data refreshes every orbit. Values above are applied the moment you release the slider.")
-
-VisualTab:Section("Sensors")
-VisualTab:Toggle({ Title = "Celestial Radar", Default = true, Flag = "esp_active" })
-VisualTab:Dropdown({
-	Title = "Signals",
-	Multi = true,
-	Options = { "Planets", "Vessels", "Debris", "Pulsars", "Comets" },
-	Default = { "Planets", "Vessels" },
-	Flag = "radar_signals",
-})
-VisualTab:Colorpicker({ Title = "Beacon Color", Default = Color3.fromRGB(92, 214, 255), Flag = "beacon_color" })
-VisualTab:Slider({ Title = "Sensor Range", Min = 500, Max = 10000, Default = 4000, Step = 250, Suffix = " au", Flag = "sensor_range" })
-VisualTab:Divider()
-VisualTab:Section("Overlay")
-VisualTab:Toggle({ Title = "Starlight Reticle", Default = false, Flag = "reticle_active" })
-VisualTab:Slider({ Title = "Reticle Radius", Min = 2, Max = 20, Default = 8, Step = 1, Suffix = " px", Flag = "reticle_size" })
-
-ShipTab:Section("Thrusters")
-ShipTab:Toggle({
-	Title = "Hyper-Drive",
-	Default = false,
-	Flag = "engine_boost",
-	Callback = function(on)
-		pcall(function()
-			local hum = humanoid()
-			if hum then hum.WalkSpeed = on and (Kirin:Get("engine_spd") or 60) or 16 end
-		end)
-	end,
-})
-ShipTab:Slider({
-	Title = "Throttle",
-	Min = 16, Max = 300, Default = 60, Step = 1,
-	Flag = "engine_spd",
-	Callback = function(v)
-		if Kirin:Get("engine_boost") then
-			pcall(function()
-				local hum = humanoid()
-				if hum then hum.WalkSpeed = v end
-			end)
-		end
-	end,
-})
-ShipTab:Slider({
-	Title = "Anti-Gravity",
-	Min = 50, Max = 400, Default = 50, Step = 5,
-	Flag = "thruster_power",
-	Callback = function(v)
-		pcall(function()
-			local hum = humanoid()
-			if hum then hum.JumpPower = v end
-		end)
-	end,
-})
-ShipTab:Keybind({ Title = "Boost Ignition", Default = 0x10, Mode = "hold", Flag = "burst_key" })
-ShipTab:Section("Tools")
-ShipTab:Toggle({ Title = "Quantum Phasing", Type = "Checkbox", Default = false, Flag = "quantum_noclip" })
-ShipTab:Button({
-	Title = "Emergency Orbit Reset", Icon = "reset",
-	Callback = function()
-		Kirin:Notify({ Title = "Hyper-jump", Content = "Vessel returning to the station hub.", Type = "info", Duration = 3 })
-	end,
-})
-
-SystemTab:Section("Palette")
-SystemTab:Dropdown({
-	Title = "Constellation",
-	Options = { "Cosmos", "Nebula", "Supernova", "Aurora" },
-	Default = "Cosmos",
-	Callback = function(name)
-		Kirin:SetTheme(name)
-		Kirin:Notify({ Title = "Palette set", Content = "Hull lights now tuned to " .. name .. ".", Type = "success", Duration = 3 })
-	end,
-})
-SystemTab:Keybind({
-	Title = "Panel Hotkey",
-	Default = 0x79,
-	Mode = "toggle",
-	Callback = function(k) Window:SetToggleKey(k) end,
-})
-SystemTab:Section("Window")
-SystemTab:Input({ Title = "Sector Search", Placeholder = "name or id", Flag = "coordinate_filter" })
-local reservoir = SystemTab:Progressbar({ Title = "Antimatter Reservoir", Default = 0.62 })
-task.spawn(function()
-	local p = 0.62
-	while Kirin._alive do
-		p = p + 0.04
-		if p > 1 then p = 0.12 end
-		reservoir:SetProgress(p)
-		task.wait(1.6)
-	end
-end)
-SystemTab:Toggle({
-	Title = "Show Watermark",
-	Default = true,
-	Callback = function(v) Mark:SetVisible(v) end,
-})
-SystemTab:Button({ Title = "Compact / Expanded View", Icon = "expand", Callback = function() Window:ToggleExpand() end })
-SystemTab:Button({ Title = "Dock to Bob", Icon = "dock", Callback = function() Window:Minimize() end })
-SystemTab:Button({
-	Title = "Decommission UI",
-	Icon = "close", Style = "danger",
-	Callback = function()
-		Kirin:Notify({ Title = "Shutting down", Content = "Closing Astra Cosmos.", Type = "error", Duration = 1.4 })
-		task.wait(1.1)
-		Window:Destroy()
-	end,
-})
-
-task.wait(0.5)
-Kirin:Notify({
-	Title = "Astra online",
-	Content = "F10 hides the panel. The yellow dot docks it to Bob. Drag the corner dots to resize.",
-	Type = "success",
-	Duration = 6,
-})
-print("[Astra] rev 3.2 loaded")
+return Kirin
